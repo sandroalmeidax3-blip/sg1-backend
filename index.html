@@ -387,6 +387,26 @@ footer .bottom .equipe{cursor:default;user-select:none}
 .ia-bubble.ai{align-self:flex-start;background:#fff;border:1px solid var(--line);color:var(--ink);border-bottom-left-radius:4px;font-family:'Spectral',serif}
 .ia-bubble.ai b{font-family:'Inter',sans-serif}
 .ia-bubble.think{align-self:flex-start;color:var(--grey);font-style:italic;font-size:13px}
+/* radar de pautas + modal */
+.pauta{background:#fff;border:1px solid var(--line);border-left:4px solid var(--red);border-radius:11px;padding:14px 16px}
+.pauta .p-top{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin-bottom:7px}
+.pauta .tag{font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.4px;padding:3px 9px;border-radius:20px;background:#eef;color:#33459e}
+.pauta .tag.tema{background:#fdecec;color:var(--red)}
+.pauta .tag.alto{background:#fde2e1;color:#c0271f}
+.pauta .tag.médio,.pauta .tag.medio{background:#fff3d6;color:#a9760a}
+.pauta .tag.baixo{background:#e6f4ea;color:#1d7a3a}
+.pauta .tag.data{background:#eee;color:#555}
+.pauta h4{font-size:16px;color:var(--ink);margin:2px 0 5px;line-height:1.3}
+.pauta p{font-size:13.5px;color:var(--ink-2);line-height:1.5;margin-bottom:10px}
+.pauta .p-acts{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
+.pauta .p-link{font-size:12.5px;font-weight:700;color:#33459e;text-decoration:none}
+.pauta .p-prep{background:var(--red);color:#fff;font-weight:800;font-size:13px;padding:8px 14px;border-radius:9px;cursor:pointer}
+.ia-modal{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);align-items:center;justify-content:center;padding:18px}
+.ia-modal.show{display:flex}
+.ia-modal-box{background:#fff;border-radius:16px;max-width:620px;width:100%;max-height:88vh;overflow:auto;padding:26px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.ia-modal-x{position:absolute;top:12px;right:14px;font-size:26px;font-weight:900;color:var(--grey);line-height:1;cursor:pointer}
+.ia-modal-tag{display:inline-block;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;color:#fff;background:var(--red);padding:3px 11px;border-radius:20px;margin-bottom:8px}
+.ia-modal-box h3{font-size:22px;margin:6px 0 6px;color:var(--ink);line-height:1.25}
 </style>
 </head>
 <body>
@@ -670,6 +690,25 @@ footer .bottom .equipe{cursor:default;user-select:none}
           <button class="submitbtn" id="iaLicBtn" style="margin-top:4px">🔄 Pesquisar e analisar</button>
         </div>
 
+        <label class="ia-step">🛰️ Radar de pautas na web — São Gonçalo e região</label>
+        <div style="background:var(--soft);border:1px solid var(--line);border-radius:11px;padding:14px;margin-bottom:6px">
+          <div style="font-size:13px;color:var(--ink-2);margin-bottom:11px">A IA pesquisa na internet assuntos recentes da região, separa por <b>tema, região, impacto e data</b> com o <b>link da matéria</b>. Em cada pauta há um botão <b>"Preparar matéria"</b> que escreve o texto pronto pra publicar.</div>
+          <div class="row2">
+            <div class="field"><label>Região (opcional)</label>
+              <select id="iaPautaRegiao">
+                <option value="">Todas</option>
+                <option>São Gonçalo</option><option>Niterói</option><option>Itaboraí</option>
+                <option>Maricá</option><option>Tanguá</option><option>Rio Bonito</option>
+                <option>Região Metropolitana / Leste Fluminense</option>
+              </select>
+            </div>
+            <div class="field"><label>Tema (opcional)</label><input id="iaPautaTema" placeholder="ex.: segurança, saúde, política…"></div>
+          </div>
+          <button class="submitbtn" id="iaPautaBtn">🛰️ Buscar pautas na web</button>
+        </div>
+        <div id="iaPautasStatus" style="display:none;margin-top:12px;font-weight:800;color:var(--red)"></div>
+        <div id="iaPautasList" style="margin-top:12px;display:grid;gap:11px"></div>
+
         <label class="ia-step">2 · Anexe o(s) PDF(s)</label>
         <label for="iaFiles" class="ia-drop">📎 Anexar PDF do diário <span>(pode anexar vários para comparar)</span></label>
         <input id="iaFiles" type="file" accept="application/pdf" multiple style="display:none">
@@ -693,6 +732,21 @@ footer .bottom .equipe{cursor:default;user-select:none}
 
         <div class="notice" style="margin-top:16px">🔒 A chave da OpenAI fica <b>só no servidor</b>. PDFs escaneados (imagem) podem não ser lidos. Investigar na web tem custo por busca na OpenAI.</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Janela (modal) da matéria pronta -->
+<div id="matModal" class="ia-modal">
+  <div class="ia-modal-box">
+    <button id="matClose" class="ia-modal-x" aria-label="Fechar">×</button>
+    <span class="ia-modal-tag">Matéria pronta</span>
+    <h3 id="matTitulo"></h3>
+    <p id="matLinha" style="font-weight:700;color:var(--ink-2);font-size:15px;margin-top:-2px"></p>
+    <div id="matCorpo" style="white-space:pre-wrap;font-family:'Spectral',serif;font-size:15px;line-height:1.7;margin-top:12px;color:var(--ink)"></div>
+    <div class="row2" style="margin-top:18px">
+      <button class="submitbtn" id="matCopiar">📋 Copiar texto</button>
+      <button class="submitbtn" id="matEnviar" style="background:var(--ink)">📤 Enviar para Notícias</button>
     </div>
   </div>
 </div>
@@ -1545,6 +1599,85 @@ document.getElementById('iaLicBtn').onclick=async()=>{
     renderIaDocs();
     iaConversar(`Acabei de puxar o mural de ${tipo} de São Gonçalo${periodo}${termo?' filtrando por "'+termo+'"':''} (documento anexado, dados públicos). Liste os itens relevantes separando por assunto. Destaque valores altos, objetos de interesse público e qualquer coisa atípica que mereça apuração jornalística. Para cada item, cite o nº do edital/processo e inclua o link de "Detalhes".`);
   }catch(e){toast('❌ Erro ao acessar o mural de licitações');}
+};
+
+/* ---- Radar de pautas na web + gerar matéria ---- */
+let radarPautas=[];
+function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function renderPautas(){
+  const box=document.getElementById('iaPautasList');
+  box.innerHTML=radarPautas.map((p,i)=>{
+    const imp=(p.impacto||'').toLowerCase();
+    return `<div class="pauta">
+      <div class="p-top">
+        ${p.tema?`<span class="tag tema">${esc(p.tema)}</span>`:''}
+        ${p.regiao?`<span class="tag">${esc(p.regiao)}</span>`:''}
+        ${p.impacto?`<span class="tag ${imp}">impacto ${esc(p.impacto)}</span>`:''}
+        ${p.data?`<span class="tag data">${esc(p.data)}</span>`:''}
+      </div>
+      <h4>${esc(p.titulo||'Pauta')}</h4>
+      ${p.resumo?`<p>${esc(p.resumo)}</p>`:''}
+      <div class="p-acts">
+        ${p.link?`<a class="p-link" href="${esc(p.link)}" target="_blank" rel="noopener">🔗 ver matéria/fonte ↗</a>`:''}
+        <button class="p-prep" onclick="prepararMateria(${i})">✍️ Preparar matéria</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+document.getElementById('iaPautaBtn').onclick=async()=>{
+  const key=iaGetKey(); if(!key){toast('Salve a chave de acesso primeiro');iaRefreshKeyUI();return;}
+  const regiao=document.getElementById('iaPautaRegiao').value;
+  const tema=document.getElementById('iaPautaTema').value.trim();
+  const st=document.getElementById('iaPautasStatus');
+  radarPautas=[];renderPautas();
+  st.style.display='block';st.innerHTML='🛰️ Pesquisando pautas na web… (alguns segundos)';
+  try{
+    const r=await fetch(`${API_BASE}/api/pautas`,{method:'POST',headers:{'Content-Type':'application/json','x-admin-key':key},body:JSON.stringify({regiao,tema})});
+    const j=await r.json();
+    if(!j.ok){st.innerHTML='❌ '+(j.error||'Não foi possível buscar.');return;}
+    radarPautas=j.pautas||[];
+    if(!radarPautas.length){st.innerHTML='Não encontrei pautas estruturadas. '+(j.raw?'Resposta da IA: '+esc(j.raw).slice(0,400):'');return;}
+    st.innerHTML=`✅ ${radarPautas.length} pautas encontradas. Clique em "Preparar matéria" para a IA escrever o texto.`;
+    renderPautas();
+  }catch(e){st.innerHTML='❌ Erro de conexão com o servidor (pode levar ~40s pra acordar). Tente de novo.';}
+};
+
+let _matAtual=null;
+function abrirMatModal(){document.getElementById('matModal').classList.add('show');}
+function fecharMatModal(){document.getElementById('matModal').classList.remove('show');}
+window.prepararMateria=async i=>{
+  const key=iaGetKey(); if(!key){toast('Salve a chave de acesso primeiro');iaRefreshKeyUI();return;}
+  const p=radarPautas[i]; if(!p) return;
+  toast('✍️ A IA está escrevendo a matéria…');
+  try{
+    const r=await fetch(`${API_BASE}/api/materia`,{method:'POST',headers:{'Content-Type':'application/json','x-admin-key':key},
+      body:JSON.stringify({titulo:p.titulo,resumo:p.resumo,link:p.link,tema:p.tema,regiao:p.regiao,useSearch:document.getElementById('iaSearch').checked})});
+    const j=await r.json();
+    if(!j.ok){toast('❌ '+(j.error||'Falha ao gerar a matéria'));return;}
+    _matAtual=j.materia;
+    document.getElementById('matTitulo').textContent=_matAtual.titulo||p.titulo||'';
+    document.getElementById('matLinha').textContent=_matAtual.linha_fina||'';
+    document.getElementById('matCorpo').textContent=_matAtual.corpo||'';
+    abrirMatModal();
+  }catch(e){toast('❌ Erro ao gerar a matéria');}
+};
+document.getElementById('matClose').onclick=fecharMatModal;
+document.getElementById('matModal').addEventListener('click',e=>{if(e.target.id==='matModal')fecharMatModal();});
+document.getElementById('matCopiar').onclick=async()=>{
+  if(!_matAtual) return;
+  const txt=(_matAtual.titulo||'')+'\\n\\n'+(_matAtual.linha_fina||'')+'\\n\\n'+(_matAtual.corpo||'');
+  try{await navigator.clipboard.writeText(txt);toast('📋 Texto copiado!');}
+  catch(e){const ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast('📋 Texto copiado!');}
+};
+document.getElementById('matEnviar').onclick=()=>{
+  if(!_matAtual) return;
+  document.getElementById('fTitle').value=_matAtual.titulo||'';
+  document.getElementById('fSummary').value=_matAtual.linha_fina||'';
+  document.getElementById('fBody').value=_matAtual.corpo||'';
+  fecharMatModal();
+  const b=document.querySelector('.cms-tabs button[data-tab="news"]'); if(b) b.click();
+  document.querySelector('.cms-body').scrollTo({top:0});window.scrollTo({top:0});
+  toast('📤 Matéria jogada na aba Notícias! Revise e publique.');
 };
 iaRefreshKeyUI();
 

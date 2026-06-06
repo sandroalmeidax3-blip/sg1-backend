@@ -234,12 +234,10 @@ function montarContextoDocs(docs) {
   return partes.join('\n\n');
 }
 
-async function chatOpenAI({ messages, docs, useSearch }) {
+async function openaiChat({ system, messages, useSearch = false, maxTokens = 1800 }) {
   if (!OPENAI_API_KEY) throw new Error('A chave da OpenAI não está configurada no servidor (OPENAI_API_KEY).');
-  const ctx = montarContextoDocs(docs);
-  const sys = PERSONA + (ctx ? ('\n\nDOCUMENTOS ANEXADOS PELO EDITOR (base principal da análise):\n' + ctx) : '\n\n(Nenhum documento anexado ainda.)');
-  const msgs = [{ role: 'system', content: sys }, ...messages];
-  const body = { model: useSearch ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, messages: msgs, max_tokens: 1900 };
+  const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages;
+  const body = { model: useSearch ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, messages: msgs, max_tokens: maxTokens };
   if (useSearch) body.web_search_options = { search_context_size: 'medium' };
   else body.temperature = 0.3;
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -249,8 +247,22 @@ async function chatOpenAI({ messages, docs, useSearch }) {
   });
   const j = await r.json();
   if (j.error) throw new Error(j.error.message || 'Erro na OpenAI');
-  const msg = j.choices?.[0]?.message || {};
-  return { reply: msg.content || '', annotations: msg.annotations || [] };
+  const m = j.choices?.[0]?.message || {};
+  return { reply: m.content || '', annotations: m.annotations || [] };
+}
+
+function extrairJson(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim().replace(/```json/gi, '').replace(/```/g, '').trim();
+  const i = s.indexOf('{'), j = s.lastIndexOf('}');
+  if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)); } catch (e) {} }
+  return null;
+}
+
+async function chatOpenAI({ messages, docs, useSearch }) {
+  const ctx = montarContextoDocs(docs);
+  const sys = PERSONA + (ctx ? ('\n\nDOCUMENTOS ANEXADOS PELO EDITOR (base principal da análise):\n' + ctx) : '\n\n(Nenhum documento anexado ainda.)');
+  return openaiChat({ system: sys, messages, useSearch, maxTokens: 1900 });
 }
 
 // extrai o texto de UM pdf (base64) por vez
@@ -280,6 +292,43 @@ app.post('/api/diario/chat', async (req, res) => {
     res.json({ ok: true, reply: out.reply, annotations: out.annotations });
   } catch (e) {
     console.error('Diário chat:', e.message);
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- Radar de pautas na web (jornalismo) ----
+app.post('/api/pautas', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
+  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas requisições em pouco tempo. Aguarde um pouco.' });
+  try {
+    const { regiao = '', tema = '' } = req.body || {};
+    const foco = [regiao && ('Região: ' + regiao), tema && ('Tema: ' + tema)].filter(Boolean).join('. ');
+    const sys = 'Você é editor de pautas do portal SG1 Notícias (São Gonçalo - RJ). Pesquise na web notícias e assuntos RECENTES (últimos dias/semanas) e relevantes de São Gonçalo e região (Niterói, Itaboraí, Maricá, Tanguá, Rio Bonito e Leste Fluminense / Região Metropolitana do Rio de Janeiro). ' + (foco ? ('Foco solicitado: ' + foco + '. ') : '') + 'Retorne SOMENTE um JSON no formato {"pautas":[{"titulo":"","tema":"ex: segurança, saúde, educação, política, economia, infraestrutura, cultura","regiao":"ex: São Gonçalo, Niterói","impacto":"alto|médio|baixo","data":"AAAA-MM-DD ou texto","resumo":"2 a 3 frases","link":"URL real da matéria/fonte"}]}. Use fontes reais e links verificáveis. Não invente links nem fatos.';
+    const out = await openaiChat({ system: sys, messages: [{ role: 'user', content: 'Liste de 6 a 10 pautas recentes e relevantes de São Gonçalo e região, cada uma com link real da fonte.' }], useSearch: true, maxTokens: 2200 });
+    const j = extrairJson(out.reply);
+    const pautas = (j && Array.isArray(j.pautas)) ? j.pautas : [];
+    res.json({ ok: true, pautas, raw: pautas.length ? undefined : out.reply });
+  } catch (e) {
+    console.error('Pautas:', e.message);
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- Gerar texto da matéria (redator jornalista) ----
+app.post('/api/materia', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
+  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas requisições em pouco tempo. Aguarde um pouco.' });
+  try {
+    const { titulo = '', resumo = '', link = '', tema = '', regiao = '', useSearch = true } = req.body || {};
+    if (!titulo) return res.status(400).json({ ok: false, error: 'Sem pauta para escrever.' });
+    const sys = 'Você é redator jornalista do portal SG1 Notícias (São Gonçalo - RJ). Escreva uma matéria completa, pronta para publicar, com apuração responsável. ' + (useSearch ? 'Pesquise na web para confirmar e enriquecer os fatos. ' : '') + 'Estrutura: um título jornalístico e chamativo, uma linha fina (subtítulo) e o CORPO com lide (o quê, quem, quando, onde, por quê), desenvolvimento e contexto local de São Gonçalo. Tom jornalístico, claro e imparcial. NÃO invente dados, números ou declarações; se não confirmar, não afirme. Português do Brasil. Retorne SOMENTE um JSON: {"titulo":"","linha_fina":"","corpo":"texto com parágrafos separados por quebras de linha"}.';
+    const user = 'Pauta: ' + titulo + '\nTema: ' + tema + ' | Região: ' + regiao + '\nResumo: ' + resumo + '\nFonte de referência: ' + link;
+    const out = await openaiChat({ system: sys, messages: [{ role: 'user', content: user }], useSearch: !!useSearch, maxTokens: 2400 });
+    const j = extrairJson(out.reply);
+    if (j && j.corpo) res.json({ ok: true, materia: j });
+    else res.json({ ok: true, materia: { titulo, linha_fina: '', corpo: out.reply } });
+  } catch (e) {
+    console.error('Matéria:', e.message);
     res.status(502).json({ ok: false, error: e.message });
   }
 });
