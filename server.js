@@ -234,12 +234,13 @@ function montarContextoDocs(docs) {
   return partes.join('\n\n');
 }
 
-async function openaiChat({ system, messages, useSearch = false, maxTokens = 1800 }) {
+async function openaiChat({ system, messages, useSearch = false, maxTokens = 1800, model, json = false, searchContext = 'medium' }) {
   if (!OPENAI_API_KEY) throw new Error('A chave da OpenAI não está configurada no servidor (OPENAI_API_KEY).');
   const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages;
-  const body = { model: useSearch ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, messages: msgs, max_tokens: maxTokens };
-  if (useSearch) body.web_search_options = { search_context_size: 'medium' };
-  else body.temperature = 0.3;
+  const mdl = model || (useSearch ? OPENAI_SEARCH_MODEL : OPENAI_MODEL);
+  const body = { model: mdl, messages: msgs, max_tokens: maxTokens };
+  if (useSearch) body.web_search_options = { search_context_size: searchContext };
+  else { body.temperature = 0.3; if (json) body.response_format = { type: 'json_object' }; }
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY },
@@ -303,11 +304,32 @@ app.post('/api/pautas', async (req, res) => {
   try {
     const { regiao = '', tema = '' } = req.body || {};
     const foco = [regiao && ('Região: ' + regiao), tema && ('Tema: ' + tema)].filter(Boolean).join('. ');
-    const sys = 'Você é editor de pautas do portal SG1 Notícias (São Gonçalo - RJ). Pesquise na web notícias e assuntos RECENTES (últimos dias/semanas) e relevantes de São Gonçalo e região (Niterói, Itaboraí, Maricá, Tanguá, Rio Bonito e Leste Fluminense / Região Metropolitana do Rio de Janeiro). ' + (foco ? ('Foco solicitado: ' + foco + '. ') : '') + 'Retorne SOMENTE um JSON no formato {"pautas":[{"titulo":"","tema":"ex: segurança, saúde, educação, política, economia, infraestrutura, cultura","regiao":"ex: São Gonçalo, Niterói","impacto":"alto|médio|baixo","data":"AAAA-MM-DD ou texto","resumo":"2 a 3 frases","link":"URL real da matéria/fonte"}]}. Use fontes reais e links verificáveis. Não invente links nem fatos.';
-    const out = await openaiChat({ system: sys, messages: [{ role: 'user', content: 'Liste de 6 a 10 pautas recentes e relevantes de São Gonçalo e região, cada uma com link real da fonte.' }], useSearch: true, maxTokens: 2200 });
-    const j = extrairJson(out.reply);
-    const pautas = (j && Array.isArray(j.pautas)) ? j.pautas : [];
-    res.json({ ok: true, pautas, raw: pautas.length ? undefined : out.reply });
+    const agora = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+    const dd = String(agora.getDate()).padStart(2, '0');
+    const mm = String(agora.getMonth() + 1).padStart(2, '0');
+    const hojeStr = dd + '/' + mm + '/' + agora.getFullYear();
+
+    // PASSO 1 — pesquisa REAL na web (Google + veículos da região)
+    const sysBusca = 'Você é repórter do portal SG1 Notícias (São Gonçalo - RJ). HOJE é ' + hojeStr + '. Pesquise NO GOOGLE e em sites de notícias relevantes da região — como O São Gonçalo (osaogoncalo.com.br), O Fluminense (ofluminense.com.br), G1 Rio, Band, e outros veículos locais e estaduais — as notícias das ÚLTIMAS 24 HORAS (hoje ou ontem) sobre São Gonçalo e região (Niterói, Itaboraí, Maricá, Tanguá, Rio Bonito, Leste Fluminense / Região Metropolitana do Rio). ' + (foco ? ('Foco: ' + foco + '. ') : '') + 'Para CADA notícia recente encontrada, traga: título, data de publicação, veículo/fonte, link e um resumo curto. Não invente. Se realmente não houver nada das últimas 24h, diga "Sem notícias nas últimas 24h".';
+    const busca = await openaiChat({ system: sysBusca, messages: [{ role: 'user', content: 'Pesquise e liste as notícias das últimas 24h de São Gonçalo e região, com veículo, data e link real.' }], useSearch: true, model: 'gpt-4o-search-preview', searchContext: 'high', maxTokens: 2400 });
+
+    // PASSO 2 — estrutura em JSON limpo (modelo comum, mais confiável p/ JSON)
+    const sysEstrut = 'Você organiza notícias em JSON. HOJE é ' + hojeStr + '. A partir do TEXTO abaixo (resultado de uma busca na web), monte SOMENTE um JSON {"pautas":[{"titulo":"","tema":"ex: segurança, saúde, educação, política, economia, infraestrutura, cultura","regiao":"ex: São Gonçalo, Niterói","impacto":"alto|médio|baixo","data":"AAAA-MM-DD","resumo":"2 a 3 frases","link":"URL real citada no texto"}]}. Inclua SOMENTE itens das últimas 24h (hoje/ontem); descarte o resto. Use apenas links que aparecem no texto; não invente. Se não houver itens recentes, retorne {"pautas":[]}.';
+    const estrut = await openaiChat({ system: sysEstrut, messages: [{ role: 'user', content: 'TEXTO DA BUSCA:\n\n' + (busca.reply || '(vazio)') }], json: true, maxTokens: 2000 });
+    const j = extrairJson(estrut.reply);
+    let pautas = (j && Array.isArray(j.pautas)) ? j.pautas : [];
+
+    // filtro de recência (descarta > 1 dia; mantém sem data reconhecível)
+    const hoje0 = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
+    const corte = new Date(hoje0.getTime() - 1 * 24 * 3600 * 1000);
+    function parseData(x) {
+      if (!x) return null;
+      let m = String(x).match(/(\d{4})-(\d{2})-(\d{2})/); if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+      m = String(x).match(/(\d{2})\/(\d{2})\/(\d{4})/); if (m) return new Date(+m[3], +m[2] - 1, +m[1]);
+      return null;
+    }
+    pautas = pautas.filter(p => { const d = parseData(p.data); return !d || d >= corte; });
+    res.json({ ok: true, pautas, raw: pautas.length ? undefined : (busca.reply || '').slice(0, 500) });
   } catch (e) {
     console.error('Pautas:', e.message);
     res.status(502).json({ ok: false, error: e.message });
