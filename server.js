@@ -40,7 +40,7 @@ const saveTokens = (d) => fs.writeFileSync(TOKENS_FILE, JSON.stringify(d, null, 
 const clearTokens = () => { try { fs.unlinkSync(TOKENS_FILE); } catch {} };
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '6mb' }));
 app.use(cors({ origin: [SITE_URL, 'http://localhost:5500', 'http://127.0.0.1:5500', 'http://localhost:3000'] }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -195,6 +195,96 @@ app.post('/auth/refresh', async (req, res) => {
     saveTokens({ ...t, igToken: j.access_token, refreshedAt: new Date().toISOString() });
     res.json({ ok: true });
   } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// ============================================================
+//  7) Diário Oficial + IA (somente admin) — usa OpenAI
+//     A chave fica SÓ aqui no servidor (variável OPENAI_API_KEY).
+// ============================================================
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+const FONTES = {
+  sg: 'Diário Oficial da Prefeitura de São Gonçalo - RJ',
+  rj: 'Diário Oficial do Estado do Rio de Janeiro (IOERJ)',
+  alerj: 'Diário Oficial da ALERJ (Poder Legislativo do RJ)',
+  todos: 'Diários Oficiais de São Gonçalo e região'
+};
+
+// limite simples de uso (protege os créditos da OpenAI contra abuso)
+let iaHits = [];
+function iaRateOk() {
+  const now = Date.now();
+  iaHits = iaHits.filter(t => now - t < 60 * 60 * 1000);
+  if (iaHits.length >= 60) return false; // máx 60 análises por hora
+  iaHits.push(now);
+  return true;
+}
+
+async function fetchDiarioContent(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 SG1Bot' } });
+  if (!r.ok) throw new Error('Não consegui acessar o link (HTTP ' + r.status + ').');
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  if (ct.includes('pdf') || url.toLowerCase().endsWith('.pdf')) {
+    const buf = Buffer.from(await r.arrayBuffer());
+    try {
+      const mod = await import('pdf-parse/lib/pdf-parse.js');
+      const pdfParse = mod.default || mod;
+      const data = await pdfParse(buf);
+      return data.text || '';
+    } catch (e) {
+      throw new Error('Esse link é um PDF que não consegui ler sozinho. Copie o texto do diário e cole no campo de texto.');
+    }
+  }
+  const html = await r.text();
+  return html.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+             .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+             .replace(/<[^>]+>/g, ' ')
+             .replace(/\s+/g, ' ').trim();
+}
+
+async function askOpenAI(system, user) {
+  if (!OPENAI_API_KEY) throw new Error('A chave da OpenAI não está configurada no servidor (variável OPENAI_API_KEY).');
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      temperature: 0.2, max_tokens: 1600
+    })
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message || 'Erro na OpenAI');
+  return j.choices?.[0]?.message?.content || '';
+}
+
+app.post('/api/diario', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave de administrador inválida).' });
+  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas análises em pouco tempo. Tente novamente daqui a pouco.' });
+  try {
+    let { source = 'todos', url = '', text = '', mode = 'pautas', query = '' } = req.body || {};
+    let content = (text || '').trim();
+    if (!content && url) content = await fetchDiarioContent(url.trim());
+    if (!content) return res.status(400).json({ ok: false, error: 'Cole o texto do diário ou informe um link válido.' });
+    content = content.slice(0, 45000);
+
+    const fonte = FONTES[source] || FONTES.todos;
+    let system, user;
+    if (mode === 'busca') {
+      if (!query.trim()) return res.status(400).json({ ok: false, error: 'Digite o que deseja buscar (nome, empresa ou assunto).' });
+      system = `Você é um analista de redação do portal SG1 Notícias (São Gonçalo - RJ). Recebe o texto de um diário oficial (${fonte}). Procure TODAS as menções relacionadas a: "${query}". Para cada ocorrência traga: o contexto/trecho, o tipo de ato (nomeação, exoneração, licitação, contrato, etc.), valores e datas quando houver. Se não encontrar, diga claramente "Nenhuma menção encontrada". Responda em português, em tópicos, objetivo.`;
+      user = `Buscar por: ${query}\n\nTEXTO DO DIÁRIO:\n${content}`;
+    } else {
+      system = `Você é um assistente de pauta do portal SG1 Notícias (São Gonçalo - RJ). Recebe o texto de um diário oficial (${fonte}). Identifique os assuntos com POTENCIAL DE NOTÍCIA para a população: novas licitações, nomeações/posses, exonerações, contratos relevantes, concursos públicos, decretos importantes e mudanças administrativas. Para cada item retorne: • Título sugerido de notícia • Tipo • Resumo em 1-2 frases • Por que é relevante. Ignore o que for puramente burocrático e sem interesse público. Responda em português, em lista organizada.`;
+      user = `Encontre pautas relevantes neste diário:\n\n${content}`;
+    }
+    const resposta = await askOpenAI(system, user);
+    res.json({ ok: true, resposta });
+  } catch (e) {
+    console.error('Diário IA:', e.message);
     res.status(502).json({ ok: false, error: e.message });
   }
 });
