@@ -40,7 +40,7 @@ const saveTokens = (d) => fs.writeFileSync(TOKENS_FILE, JSON.stringify(d, null, 
 const clearTokens = () => { try { fs.unlinkSync(TOKENS_FILE); } catch {} };
 
 const app = express();
-app.use(express.json({ limit: '6mb' }));
+app.use(express.json({ limit: '25mb' }));
 app.use(cors({ origin: [SITE_URL, 'http://localhost:5500', 'http://127.0.0.1:5500', 'http://localhost:3000'] }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -200,109 +200,86 @@ app.post('/auth/refresh', async (req, res) => {
 });
 
 // ============================================================
-//  7) Diário Oficial + IA (somente admin) — usa OpenAI
+//  7) Diário Oficial — IA investigativa (somente admin)
 //     A chave da OpenAI fica SÓ aqui no servidor (OPENAI_API_KEY).
-//     O diário MUNICIPAL é lido pela base pública do Querido Diário.
+//     Você baixa o PDF do diário e anexa; a IA lê, resume e investiga.
 // ============================================================
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_SEARCH_MODEL = process.env.OPENAI_SEARCH_MODEL || 'gpt-4o-mini-search-preview';
 
-const IBGE = { sg: '3304904' }; // São Gonçalo - RJ (código IBGE p/ Querido Diário)
-const FONTES = {
-  sg: 'Diário Oficial do Município de São Gonçalo - RJ',
-  rj: 'Diário Oficial do Estado do Rio de Janeiro (IOERJ)',
-  alerj: 'Diário Oficial da ALERJ',
-  todos: 'Diários Oficiais de São Gonçalo e região'
-};
-
-// rate limit simples (protege os créditos da OpenAI contra abuso)
 let iaHits = [];
-function iaRateOk() { const now = Date.now(); iaHits = iaHits.filter(t => now - t < 3600000); if (iaHits.length >= 60) return false; iaHits.push(now); return true; }
+function iaRateOk() { const now = Date.now(); iaHits = iaHits.filter(t => now - t < 3600000); if (iaHits.length >= 120) return false; iaHits.push(now); return true; }
 
-// Consulta o Querido Diário (gratuito) por data e/ou texto
-async function buscarQueridoDiario({ ibge, date, query }) {
-  const p = new URLSearchParams({ territory_ids: ibge, size: '10', excerpt_size: '1200', number_of_excerpts: '3', sort_by: 'descending_date' });
-  if (date) { p.set('published_since', date); p.set('published_until', date); }
-  if (query) p.set('querystring', query);
-  const r = await fetch('https://api.queridodiario.ok.org.br/gazettes?' + p.toString());
-  if (!r.ok) throw new Error('Não consegui consultar a base de diários (HTTP ' + r.status + ').');
-  const j = await r.json();
-  return j.gazettes || [];
-}
-async function baixarTextoEdicao(txt_url) {
-  try { const r = await fetch(txt_url); if (!r.ok) return ''; return await r.text(); } catch { return ''; }
+async function extrairPdf(base64) {
+  const buf = Buffer.from(base64, 'base64');
+  const mod = await import('pdf-parse/lib/pdf-parse.js');
+  const pdfParse = mod.default || mod;
+  const data = await pdfParse(buf);
+  return (data.text || '').trim();
 }
 
-async function askOpenAI(system, user) {
+const PERSONA = 'Você é um jornalista investigativo experiente do portal SG1 Notícias, de São Gonçalo (RJ). Sua função: ler diários oficiais e documentos públicos e identificar o que tem interesse público e potencial de notícia (licitações, contratos, nomeações/posses, exonerações, concursos, decretos, valores atípicos, possíveis irregularidades). Seja rigoroso e baseie-se no que está nos documentos, citando trechos quando útil. Separe a análise por ASSUNTO. Aponte o que merece apuração e sugira próximos passos de investigação. Quando puder pesquisar na web, contextualize e verifique fatos, sempre citando as fontes. Escreva em português do Brasil, de forma clara e direta.';
+
+function montarContextoDocs(docs) {
+  if (!docs || !docs.length) return '';
+  let total = 0, partes = [];
+  for (const d of docs) {
+    let t = (d.text || '').slice(0, 22000);
+    if (total + t.length > 60000) t = t.slice(0, Math.max(0, 60000 - total));
+    if (!t) break;
+    partes.push('### DOCUMENTO: ' + (d.name || 'documento') + '\n' + t);
+    total += t.length;
+  }
+  return partes.join('\n\n');
+}
+
+async function chatOpenAI({ messages, docs, useSearch }) {
   if (!OPENAI_API_KEY) throw new Error('A chave da OpenAI não está configurada no servidor (OPENAI_API_KEY).');
+  const ctx = montarContextoDocs(docs);
+  const sys = PERSONA + (ctx ? ('\n\nDOCUMENTOS ANEXADOS PELO EDITOR (base principal da análise):\n' + ctx) : '\n\n(Nenhum documento anexado ainda.)');
+  const msgs = [{ role: 'system', content: sys }, ...messages];
+  const body = { model: useSearch ? OPENAI_SEARCH_MODEL : OPENAI_MODEL, messages: msgs, max_tokens: 1900 };
+  if (useSearch) body.web_search_options = { search_context_size: 'medium' };
+  else body.temperature = 0.3;
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + OPENAI_API_KEY },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      temperature: 0.2, max_tokens: 1800,
-      response_format: { type: 'json_object' }
-    })
+    body: JSON.stringify(body)
   });
   const j = await r.json();
   if (j.error) throw new Error(j.error.message || 'Erro na OpenAI');
-  return j.choices?.[0]?.message?.content || '';
-}
-function parseItems(raw) {
-  try {
-    let s = String(raw).trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-    const obj = JSON.parse(s);
-    const arr = Array.isArray(obj) ? obj : (obj.itens || obj.items || obj.resultados || []);
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
+  const msg = j.choices?.[0]?.message || {};
+  return { reply: msg.content || '', annotations: msg.annotations || [] };
 }
 
-app.post('/api/diario', async (req, res) => {
+// extrai o texto de UM pdf (base64) por vez
+app.post('/api/diario/extract', async (req, res) => {
   if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
-  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas análises em pouco tempo. Aguarde alguns minutos.' });
   try {
-    let { source = 'sg', date = '', mode = 'pautas', query = '', text = '' } = req.body || {};
-    const fonte = FONTES[source] || FONTES.todos;
-    let content = (text || '').trim();
-    let info = '';
-
-    if (!content) {
-      if (source === 'sg' || source === 'todos') {
-        const gazettes = await buscarQueridoDiario({ ibge: IBGE.sg, date, query: mode === 'busca' ? query : '' });
-        if (!gazettes.length) {
-          return res.json({ ok: true, items: [], info: date ? ('Nenhuma edição encontrada para ' + date + ' na base do Querido Diário (pode não estar coberta ainda). Tente outra data ou use o modo manual.') : 'Informe uma data para buscar a edição.' });
-        }
-        let partes = [];
-        for (const g of gazettes) if (g.excerpts && g.excerpts.length) partes.push(g.excerpts.join('\n'));
-        if (mode === 'pautas') {
-          const full = await baixarTextoEdicao(gazettes[0].txt_url);
-          if (full) partes.unshift(full);
-          info = 'Edição ' + (gazettes[0].edition || '') + ' de ' + gazettes[0].date + '.';
-        } else {
-          info = gazettes.length + ' edição(ões) com menção a "' + query + '".';
-        }
-        content = partes.join('\n\n');
-      } else {
-        return res.json({ ok: true, items: [], info: 'A leitura automática ainda não está disponível para o diário do Estado/ALERJ. Use o modo manual (cole o texto).' });
-      }
-    }
-    if (!content.trim()) return res.json({ ok: true, items: [], info: 'Não encontrei conteúdo para analisar.' });
-    content = content.slice(0, 45000);
-
-    let system, user;
-    if (mode === 'busca') {
-      system = 'Você é analista de redação do portal SG1 Notícias (São Gonçalo-RJ). Recebe trechos de um diário oficial (' + fonte + '). Liste as menções relacionadas a "' + query + '". Responda APENAS um JSON: {"itens":[{"titulo":"...","tipo":"...","resumo":"resumo curto","detalhe":"explicação completa com contexto, valores e datas"}]}. Se não houver nada, retorne {"itens":[]}.';
-      user = 'Buscar por "' + query + '" em:\n\n' + content;
-    } else {
-      system = 'Você é assistente de pauta do portal SG1 Notícias (São Gonçalo-RJ). Recebe o texto de um diário oficial (' + fonte + '). Extraia assuntos com POTENCIAL DE NOTÍCIA (licitações, posses/nomeações, exonerações, contratos, concursos, decretos relevantes). Responda APENAS um JSON: {"itens":[{"titulo":"título de notícia sugerido","tipo":"licitação|posse|exoneração|contrato|concurso|decreto|outro","resumo":"1-2 frases","detalhe":"explicação completa: o que é, quem, valores, datas e por que é relevante para a população"}]}. Ignore o burocrático sem interesse público. Se não houver nada relevante, retorne {"itens":[]}.';
-      user = 'Diário a analisar:\n\n' + content;
-    }
-    const raw = await askOpenAI(system, user);
-    const items = parseItems(raw);
-    res.json({ ok: true, items, info });
+    const { name = 'documento.pdf', base64 = '' } = req.body || {};
+    if (!base64) return res.status(400).json({ ok: false, error: 'Arquivo vazio.' });
+    const text = await extrairPdf(base64);
+    if (!text) return res.json({ ok: true, name, text: '', aviso: 'Não consegui extrair texto — o PDF pode ser uma imagem escaneada.' });
+    res.json({ ok: true, name, text, chars: text.length });
   } catch (e) {
-    console.error('Diário IA:', e.message);
+    console.error('Extract PDF:', e.message);
+    res.status(502).json({ ok: false, error: 'Falha ao ler o PDF: ' + e.message });
+  }
+});
+
+// conversa com a IA investigativa (usa os documentos como contexto)
+app.post('/api/diario/chat', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
+  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas requisições em pouco tempo. Aguarde um pouco.' });
+  try {
+    const { messages = [], docs = [], useSearch = false } = req.body || {};
+    if (!messages.length) return res.status(400).json({ ok: false, error: 'Sem mensagem.' });
+    const hist = messages.slice(-12);
+    const out = await chatOpenAI({ messages: hist, docs, useSearch });
+    res.json({ ok: true, reply: out.reply, annotations: out.annotations });
+  } catch (e) {
+    console.error('Diário chat:', e.message);
     res.status(502).json({ ok: false, error: e.message });
   }
 });
