@@ -284,6 +284,57 @@ app.post('/api/diario/chat', async (req, res) => {
   }
 });
 
+// ---- Mural de Licitações de São Gonçalo (portal aberto) ----
+const LIC_URLS = {
+  licitacoes: 'https://licitacao.pmsg.rj.gov.br/licitacoes.php',
+  dispensas: 'https://licitacao.pmsg.rj.gov.br/dispensas.php',
+  contratos: 'https://licitacao.pmsg.rj.gov.br/contratos.php',
+  inexigibilidades: 'https://licitacao.pmsg.rj.gov.br/inexigibilidades.php'
+};
+function parseMural(html) {
+  const trs = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  const itens = [];
+  for (const tr of trs) {
+    const idm = tr.match(/([\w-]+\.php\?[\w]+=\d+)/);
+    const txt = tr.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (txt.length > 25 && idm) itens.push({ texto: txt, url: 'https://licitacao.pmsg.rj.gov.br/' + idm[1] });
+  }
+  return itens;
+}
+app.get('/api/licitacoes', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
+  try {
+    const tipo = (req.query.tipo || 'licitacoes');
+    const termo = (req.query.termo || '').trim().toLowerCase();
+    const dataIni = (req.query.dataIni || '').replace(/-/g, ''); // yyyymmdd
+    const dataFim = (req.query.dataFim || '').replace(/-/g, '');
+    const url = LIC_URLS[tipo] || LIC_URLS.licitacoes;
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 SG1Bot' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const html = await r.text();
+    let itens = parseMural(html);
+    // filtro por data (usa a data dd/mm/aaaa que aparece na linha)
+    if (dataIni || dataFim) {
+      itens = itens.filter(it => {
+        const m = it.texto.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+        if (!m) return true; // sem data reconhecível: mantém
+        const d = m[3] + m[2] + m[1];
+        if (dataIni && d < dataIni) return false;
+        if (dataFim && d > dataFim) return false;
+        return true;
+      });
+    }
+    // filtro por termo
+    if (termo) itens = itens.filter(it => it.texto.toLowerCase().includes(termo));
+    itens = itens.slice(0, 60);
+    const texto = itens.map((it, i) => (i + 1) + '. ' + it.texto + '\n   Detalhes: ' + it.url).join('\n\n');
+    res.json({ ok: true, count: itens.length, texto, fonte: url });
+  } catch (e) {
+    console.error('Licitações:', e.message);
+    res.status(502).json({ ok: false, error: 'Não consegui acessar o mural de licitações: ' + e.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.send('SG1 Instagram backend ativo ✅'));
 
 // Mostra no log se as configurações chegaram (sem expor segredos)
