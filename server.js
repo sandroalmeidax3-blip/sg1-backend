@@ -406,6 +406,38 @@ app.get('/api/licitacoes', async (req, res) => {
   }
 });
 
+// === Puxa SÓ a imagem de um post público do Instagram (sem token/API da Meta) ===
+function igShortcode(u) {
+  const m = String(u || '').match(/instagram\.com\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+  return m ? m[1] : null;
+}
+app.get('/api/instagram/preview', async (req, res) => {
+  try {
+    const code = igShortcode(req.query.url || '');
+    if (!code) return res.status(400).json({ ok: false, error: 'URL do Instagram inválida.' });
+    const embedUrl = `https://www.instagram.com/p/${code}/embed/captioned/`;
+    const r = await fetch(embedUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+      }
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const html = await r.text();
+    let img = '';
+    let m = html.match(/"display_url":"([^"]+)"/);            // 1) JSON embutido
+    if (m) img = m[1];
+    if (!img) { m = html.match(/property="og:image"\s+content="([^"]+)"/); if (m) img = m[1]; } // 2) og:image
+    if (!img) { m = html.match(/class="EmbeddedMediaImage"[^>]*\bsrc="([^"]+)"/); if (m) img = m[1]; } // 3) <img>
+    if (!img) return res.status(404).json({ ok: false, error: 'Não achei a imagem (post pode ser privado ou indisponível).' });
+    img = img.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    res.json({ ok: true, code, image: img });
+  } catch (e) {
+    console.error('IG preview:', e.message);
+    res.status(502).json({ ok: false, error: 'Não consegui buscar a imagem: ' + e.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.send('SG1 Instagram backend ativo ✅'));
 
 // Mostra no log se as configurações chegaram (sem expor segredos)
