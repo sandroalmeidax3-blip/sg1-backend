@@ -469,19 +469,24 @@ app.get('/api/instagram/preview', async (req, res) => {
 const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 const APIFY_ACTOR = process.env.APIFY_ACTOR || 'apify~instagram-scraper';
 async function apifyLatestPosts(username, limit) {
+  const fetchN = Math.max(limit + 8, 12); // pega a mais p/ ignorar fixados e ordenar por data
   const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
-  const input = { directUrls: [`https://www.instagram.com/${username}/`], resultsType: 'posts', resultsLimit: limit, addParentData: false };
+  const input = { directUrls: [`https://www.instagram.com/${username}/`], resultsType: 'posts', resultsLimit: fetchN, addParentData: false };
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
   if (!r.ok) throw new Error('Apify HTTP ' + r.status);
-  const items = await r.json();
-  return (Array.isArray(items) ? items : []).slice(0, limit).map(it => ({
+  const data = await r.json();
+  const items = Array.isArray(data) ? data : [];
+  const mapped = items.map(it => ({
     img: it.displayUrl || (Array.isArray(it.images) && it.images[0]) || '',
     caption: (it.caption || '').slice(0, 220),
     date: it.timestamp || '',
+    _ts: it.timestamp ? Date.parse(it.timestamp) : 0,
     link: it.url || (it.shortCode ? `https://www.instagram.com/p/${it.shortCode}/` : ''),
     likes: (it.likesCount != null ? it.likesCount : null),
     type: it.type || ''
   }));
+  mapped.sort((a, b) => (b._ts || 0) - (a._ts || 0)); // mais recentes primeiro (por data real)
+  return mapped.slice(0, limit).map(({ _ts, ...rest }) => rest);
 }
 app.post('/api/ig-monitor', async (req, res) => {
   if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
