@@ -465,6 +465,48 @@ app.get('/api/instagram/preview', async (req, res) => {
   }
 });
 
+// === Monitor de páginas do Instagram via Apify (últimas N de cada perfil) ===
+const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
+const APIFY_ACTOR = process.env.APIFY_ACTOR || 'apify~instagram-scraper';
+async function apifyLatestPosts(username, limit) {
+  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+  const input = { directUrls: [`https://www.instagram.com/${username}/`], resultsType: 'posts', resultsLimit: limit, addParentData: false };
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+  if (!r.ok) throw new Error('Apify HTTP ' + r.status);
+  const items = await r.json();
+  return (Array.isArray(items) ? items : []).slice(0, limit).map(it => ({
+    img: it.displayUrl || (Array.isArray(it.images) && it.images[0]) || '',
+    caption: (it.caption || '').slice(0, 220),
+    date: it.timestamp || '',
+    link: it.url || (it.shortCode ? `https://www.instagram.com/p/${it.shortCode}/` : ''),
+    likes: (it.likesCount != null ? it.likesCount : null),
+    type: it.type || ''
+  }));
+}
+app.post('/api/ig-monitor', async (req, res) => {
+  if (req.get('x-admin-key') !== ADMIN_KEY) return res.status(401).json({ ok: false, error: 'Acesso restrito (chave do painel inválida).' });
+  if (!APIFY_TOKEN) return res.status(400).json({ ok: false, error: 'APIFY_TOKEN não configurado no servidor. Adicione nas Environment Variables do Render.' });
+  if (!iaRateOk()) return res.status(429).json({ ok: false, error: 'Muitas requisições em pouco tempo. Aguarde um pouco.' });
+  try {
+    let { pages = [], limit = 5 } = req.body || {};
+    if (!Array.isArray(pages)) pages = [];
+    pages = pages.map(p => String(p).trim().replace(/^@/, '').replace(/\/+$/, '')).filter(Boolean).slice(0, 8);
+    limit = Math.min(Math.max(parseInt(limit) || 5, 1), 10);
+    if (!pages.length) return res.json({ ok: true, results: [] });
+    const settled = await Promise.allSettled(pages.map(p => apifyLatestPosts(p, limit)));
+    const results = pages.map((p, i) => ({
+      page: p,
+      ok: settled[i].status === 'fulfilled',
+      posts: settled[i].status === 'fulfilled' ? settled[i].value : [],
+      error: settled[i].status === 'rejected' ? String(settled[i].reason && settled[i].reason.message || settled[i].reason) : undefined
+    }));
+    res.json({ ok: true, results });
+  } catch (e) {
+    console.error('IG monitor:', e.message);
+    res.status(502).json({ ok: false, error: 'Falha ao buscar no Instagram: ' + e.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.send('SG1 Instagram backend ativo ✅'));
 
 // Mostra no log se as configurações chegaram (sem expor segredos)
